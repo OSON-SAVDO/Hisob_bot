@@ -2,32 +2,65 @@ import asyncio
 import datetime
 import os
 import sqlite3
+from io import BytesIO
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from aiohttp import web
+
+# Библиотекаҳо барои эҷоди PDF
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 # --- ТАНЗИМОТ ---
 TOKEN = os.getenv("TOKEN", "8560757080:AAGb9WJWfo3R9RsAA1CY37L-zmrcluov3xY")
-YOUR_TELEGRAM_ID = int(
-    os.getenv("YOUR_TELEGRAM_ID", "6900346716")
-)  # ID-и худро аз @userinfobot гиред
+YOUR_TELEGRAM_ID = int(os.getenv("YOUR_TELEGRAM_ID", "6900346716"))
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- БАЗАИ МАЪЛУМОТ ---
+# --- БАЗАИ МАЪЛУМОТ (3 РӮЙХАТИ АЛОҲИДА) ---
 conn = sqlite3.connect("expenses.db", check_same_thread=False)
 cursor = conn.cursor()
 
+# 1. Рӯйхати Кор (+ / - / соат / маблағ)
 cursor.execute(
     """
-CREATE TABLE IF NOT EXISTS transactions (
+CREATE TABLE IF NOT EXISTS work_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
-    type TEXT,
+    status TEXT, -- '+' ё '-'
+    hours REAL,
     amount REAL,
+    date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+"""
+)
+
+# 2. Рӯйхати Қарзҳо (ба ки қарз додед)
+cursor.execute(
+    """
+CREATE TABLE IF NOT EXISTS debts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    person TEXT,
+    amount REAL,
+    date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+"""
+)
+
+# 3. Рӯйхати Хароҷоти ҳаррӯза
+cursor.execute(
+    """
+CREATE TABLE IF NOT EXISTS expenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
     category TEXT,
+    amount REAL,
     date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """
@@ -44,10 +77,10 @@ CREATE TABLE IF NOT EXISTS active_shifts (
 conn.commit()
 
 
-# --- МУҲОФИЗАТ (БАРДОШТАНИ ДАСТРАСӢ БАРОИ БЕГОНАҲО) ---
+# --- МУҲОФИЗАТ ---
 @dp.message(F.from_user.id != YOUR_TELEGRAM_ID)
 async def block_unauthorized_messages(message: types.Message):
-    return  # Ба одамони бегона ҳеҷ ҷавоб намедиҳад
+    return
 
 
 @dp.callback_query(F.from_user.id != YOUR_TELEGRAM_ID)
@@ -55,7 +88,7 @@ async def block_unauthorized_callbacks(callback: types.CallbackQuery):
     await callback.answer("Дастрасӣ манъ аст!", show_alert=True)
 
 
-# --- ТУГМАҲОИ МАҲФӢ ---
+# --- ТУГМАҲО ---
 def work_menu():
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -78,12 +111,12 @@ def finance_menu():
                     text="💰 Баланс ва Омор", callback_data="show_balance"
                 ),
                 InlineKeyboardButton(
-                    text="📈 Омори ҳафта", callback_data="stats_week"
+                    text="📄 PDF Ҳисобот", callback_data="export_pdf"
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="🗑 Сабти охиринро нест кардан",
+                    text="🗑 Сабти охирини хароҷотро нест кардан",
                     callback_data="delete_last",
                 )
             ],
@@ -95,17 +128,18 @@ def get_msk_time():
     return datetime.datetime.utcnow() + datetime.timedelta(hours=3)
 
 
-# --- ФАРМОНҲО ВА КАЛИМАҲОИ МАҲФӢ ---
+# --- ФАРМОНҲО ---
 @dp.message(Command("start"))
 async def start(message: types.Message):
     await message.answer(
         "👋 Салом Админ!\n\n"
         "🔑 **Калимаҳои махфӣ:**\n"
-        "• Нависед **`кор`** — барои кушодани тугмаҳои корӣ\n"
-        "• Нависед **`хароҷот`** ё **`баланс`** — барои тугмаҳои молиявӣ\n\n"
-        "✍️ **Сабтҳо:**\n"
-        "• `300 такси` (хароҷот)\n"
-        "• `+2000 аванс` (даромад)",
+        "• Нависед **`кор`** — тугмаҳои табели корӣ\n"
+        "• Нависед **`хароҷот`** ё **`баланс`** — тугмаҳои молиявӣ\n\n"
+        "✍️ **Намунаи сабтҳо:**\n"
+        "• `300 такси` — Хароҷоти ҳаррӯза\n"
+        "• `қарз Али 500` — Қарз додам ба Али\n"
+        "• `+2000 аванс` — Даромади иловагӣ",
         parse_mode="Markdown",
     )
 
@@ -128,19 +162,17 @@ async def show_finance_menu(message: types.Message):
     )
 
 
-# --- ФУНКСИЯҲОИ ТАБЕЛИ КОРӢ (ҲИСОБИ 10 СОАТ ВА ОБЕД) ---
+# --- ТАБЕЛИ КОРӢ ---
 @dp.callback_query(F.data == "work_start")
 async def work_start(callback: types.CallbackQuery):
     now = get_msk_time()
     cursor.execute(
-        "INSERT OR REPLACE INTO active_shifts (user_id, start_time) VALUES"
-        " (?, ?)",
+        "INSERT OR REPLACE INTO active_shifts (user_id, start_time) VALUES (?, ?)",
         (callback.from_user.id, now.strftime("%Y-%m-%d %H:%M:%S")),
     )
     conn.commit()
     await callback.message.answer(
-        f"🛠 **Кор оғоз шуд!**\nСоати баромад: **{now.strftime('%H:%M')}**\nКорхотон"
-        " омад кунад!",
+        f"🛠 **Кор оғоз шуд!**\nСоати баромад: **{now.strftime('%H:%M')}**",
         parse_mode="Markdown",
     )
 
@@ -162,34 +194,25 @@ async def work_end(callback: types.CallbackQuery):
     start_time = datetime.datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
     now = get_msk_time()
 
-    # Ҳисоби вақт
     duration = now - start_time
     total_minutes = int(duration.total_seconds() / 60)
-
     full_hours = total_minutes // 60
     remaining_mins = total_minutes % 60
 
-    # Округление: Агар дақиқа аз 45 боло бошад (мисол: 18:56), ба соати пурра гузаронида мешавад
     if remaining_mins >= 45:
         full_hours += 1
 
-    # Минус 1 соат обед (агар кор аз 4 соат бештар бошад)
     if full_hours >= 4:
         work_hours = full_hours - 1
     else:
         work_hours = max(0, full_hours)
 
-    earned_rubles = round(work_hours * 500, 2)  # 500 рубл/соат
+    earned_rubles = round(work_hours * 500, 2)
 
-    # Сабт ба даромадҳо
+    # Сабт ба рӯйхати 1 (Кор)
     cursor.execute(
-        "INSERT INTO transactions (user_id, type, amount, category) VALUES (?, "
-        "'income', ?, ?)",
-        (
-            callback.from_user.id,
-            earned_rubles,
-            f"Кор ({work_hours} соат, 1 соат обед минус шуд)",
-        ),
+        "INSERT INTO work_log (user_id, status, hours, amount) VALUES (?, '+', ?, ?)",
+        (callback.from_user.id, work_hours, earned_rubles),
     )
     cursor.execute(
         "DELETE FROM active_shifts WHERE user_id = ?", (callback.from_user.id,)
@@ -197,10 +220,9 @@ async def work_end(callback: types.CallbackQuery):
     conn.commit()
 
     await callback.message.answer(
-        f"🏁 **Кор ба охир расид!**\n\n"
-        f"⏱ Соати кори соф: **{work_hours} соат** (1 соат обед тарҳ шуд)\n"
-        f"💵 Маоши ҳисобшуда: **{earned_rubles} рубл**\n"
-        f"✅ Маблағ ба баланс илова карда шуд!",
+        f"🏁 **Кор ба охир расид!** (+)\n"
+        f"⏱ Соати корӣ: **{work_hours} соат**\n"
+        f"💵 Маблағ: **{earned_rubles} рубл**",
         parse_mode="Markdown",
     )
 
@@ -208,119 +230,225 @@ async def work_end(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "work_skip")
 async def work_skip(callback: types.CallbackQuery):
     cursor.execute(
+        "INSERT INTO work_log (user_id, status, hours, amount) VALUES (?, '-', 0, 0)",
+        (callback.from_user.id,),
+    )
+    cursor.execute(
         "DELETE FROM active_shifts WHERE user_id = ?", (callback.from_user.id,)
     )
     conn.commit()
-    await callback.message.answer("❌ Имрӯз истироҳат сабт шуд.")
+    await callback.message.answer("❌ Наомадам сабт шуд (-).")
 
 
-# --- БАЛАНС ВА ОМОР ---
-@dp.callback_query(F.data == "show_balance")
-async def show_balance(callback: types.CallbackQuery):
-    cursor.execute(
-        "SELECT SUM(amount) FROM transactions WHERE user_id = ? AND type ="
-        " 'income'",
-        (callback.from_user.id,),
-    )
-    total_income = cursor.fetchone()[0] or 0.0
-
-    cursor.execute(
-        "SELECT SUM(amount) FROM transactions WHERE user_id = ? AND type ="
-        " 'expense'",
-        (callback.from_user.id,),
-    )
-    total_expense = cursor.fetchone()[0] or 0.0
-
-    balance = total_income - total_expense
-
-    msg = (
-        f"💰 **Ҳолати Молиявӣ:**\n\n"
-        f"📥 Даромади умумӣ: **{total_income} рубл**\n"
-        f"📤 Хароҷоти умумӣ: **{total_expense} рубл**\n"
-        f"-----------------------------\n"
-        f"💵 **Боқимонда (Баланс): {balance} рубл**"
-    )
-    await callback.message.answer(msg, parse_mode="Markdown")
-
-
-@dp.callback_query(F.data == "stats_week")
-async def send_stats_week(callback: types.CallbackQuery):
-    cursor.execute(
-        "SELECT category, SUM(amount) FROM transactions WHERE type = 'expense'"
-        " AND date >= date('now', '-7 days') GROUP BY category"
-    )
-    data = cursor.fetchall()
-    msg = "📊 **Хароҷоти 7 рӯзи охир:**\n\n"
-    if not data:
-        msg += "Ҳеҷ хароҷоте сабт نشده аст."
-    for row in data:
-        msg += f"• {row[0]}: {row[1]} рубл\n"
-    await callback.message.answer(msg, parse_mode="Markdown")
-
-
-@dp.callback_query(F.data == "delete_last")
-async def delete_last(callback: types.CallbackQuery):
-    cursor.execute(
-        "SELECT id, amount, category FROM transactions WHERE user_id = ?"
-        " ORDER BY id DESC LIMIT 1",
-        (callback.from_user.id,),
-    )
-    row = cursor.fetchone()
-    if row:
-        cursor.execute("DELETE FROM transactions WHERE id = ?", (row[0],))
-        conn.commit()
-        await callback.message.answer(
-            f"🗑 Сабти охирин нест карда шуд: {row[1]} рубл - {row[2]}"
-        )
-    else:
-        await callback.message.answer("⚠️ Ҳеҷ сабте ёфт нашуд.")
-
-
-# --- САБТИ ТЕКСТИИ ХАРОҶОТ ВА ДАРОМАД ---
+# --- САБТИ ТЕКСТИИ ХАРОҶОТ, ҚАРЗ ВА ДАРОМАД ---
 @dp.message()
 async def add_transaction(message: types.Message):
     text = message.text.strip()
     try:
-        if text.startswith("+"):
-            clean_text = text[1:].strip()
-            parts = clean_text.split(maxsplit=1)
-            amount = float(parts[0])
-            category = parts[1] if len(parts) > 1 else "Даромади иловагӣ"
-
+        # Сабти Қарз (Масалан: "қарз Али 500" ё "карз Васеъ 1000")
+        if text.lower().startswith(("қарз", "карз")):
+            parts = text.split(maxsplit=2)
+            person = parts[1]
+            amount = float(parts[2])
             cursor.execute(
-                "INSERT INTO transactions (user_id, type, amount, category)"
-                " VALUES (?, 'income', ?, ?)",
-                (message.from_user.id, amount, category),
+                "INSERT INTO debts (user_id, person, amount) VALUES (?, ?, ?)",
+                (message.from_user.id, person, amount),
             )
             conn.commit()
             await message.answer(
-                f"📥 Даромад сабт шуд: **+{amount} рубл** ({category})",
+                f"🤝 Қарз сабт шуд: **{person}** -> **{amount} рубл**",
                 parse_mode="Markdown",
             )
+
+        # Сабти Даромади иловагӣ (Масалан: "+2000 аванс")
+        elif text.startswith("+"):
+            clean_text = text[1:].strip()
+            parts = clean_text.split(maxsplit=1)
+            amount = float(parts[0])
+            cursor.execute(
+                "INSERT INTO work_log (user_id, status, hours, amount) VALUES (?, '+', 0, ?)",
+                (message.from_user.id, amount),
+            )
+            conn.commit()
+            await message.answer(
+                f"📥 Даромади иловагӣ сабт шуд: **+{amount} рубл**",
+                parse_mode="Markdown",
+            )
+
+        # Хароҷоти ҳаррӯза (Масалан: "300 такси")
         else:
             parts = text.split(maxsplit=1)
             amount = float(parts[0])
-            category = parts[1] if len(parts) > 1 else "Дигар"
-
+            category = parts[1] if len(parts) > 1 else "Хариди умумӣ"
             cursor.execute(
-                "INSERT INTO transactions (user_id, type, amount, category)"
-                " VALUES (?, 'expense', ?, ?)",
-                (message.from_user.id, amount, category),
+                "INSERT INTO expenses (user_id, category, amount) VALUES (?, ?, ?)",
+                (message.from_user.id, category, amount),
             )
             conn.commit()
             await message.answer(
                 f"📤 Хароҷот сабт шуд: **-{amount} рубл** ({category})",
                 parse_mode="Markdown",
             )
+
     except Exception:
         await message.answer(
-            "⚠️ Фармони номаълум.\n"
-            "• Нависед **`кор`** ё **`хароҷот`** барои тугмаҳо\n"
-            "• Ё нависед: `300 такси`, `+2000 аванс`"
+            "⚠️ Фармони номаълум!\n"
+            "• Кор: `кор` ё `хароҷот`\n"
+            "• Хароҷот: `300 такси`\n"
+            "• Қарз: `қарз Али 500`"
         )
 
 
-# --- СМС ЁДРАСКУНИИ СУБҲОНА (СОАТИ 08:00) ---
+# --- ЭҶОДИ ҲИСОБОТИ PDF (3 РӮЙХАТИ АЛОҲИДА) ---
+@dp.callback_query(F.data == "export_pdf")
+async def export_pdf(callback: types.CallbackQuery):
+    await callback.message.answer("🔄 Файли PDF тайёр шуда истодааст...")
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    elements = []
+    styles = getSampleStyleSheet()
+
+    # 1. ТАБЛИЦАИ 1: Рӯйхати Соати Корӣ ва Маблағ
+    cursor.execute(
+        "SELECT date, status, hours, amount FROM work_log WHERE user_id = ? ORDER BY id DESC",
+        (callback.from_user.id,),
+    )
+    work_data = [["Таърих", "Статус", "Соат", "Маблағ (рубл)"]]
+    for r in cursor.fetchall():
+        work_data.append([str(r[0])[:10], r[1], str(r[2]), str(r[3])])
+
+    elements.append(Paragraph("<b>1. Ruikhati Kori va Mablag</b>", styles["Title"]))
+    elements.append(Spacer(1, 10))
+    t1 = Table(work_data)
+    t1.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4CAF50")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                ("GRID", (0, 0), (-1, -1), 1, colors.black),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ]
+        )
+    )
+    elements.append(t1)
+    elements.append(Spacer(1, 20))
+
+    # 2. ТАБЛИЦАИ 2: Рӯйхати Қарзҳо
+    cursor.execute(
+        "SELECT date, person, amount FROM debts WHERE user_id = ? ORDER BY id DESC",
+        (callback.from_user.id,),
+    )
+    debt_data = [["Таърих", "Ба ки (Шахс)", "Маблағ (рубл)"]]
+    for r in cursor.fetchall():
+        debt_data.append([str(r[0])[:10], r[1], str(r[2])])
+
+    elements.append(
+        Paragraph("<b>2. Ruikhati Qarzhoi Dodashuda</b>", styles["Title"])
+    )
+    elements.append(Spacer(1, 10))
+    t2 = Table(debt_data)
+    t2.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#FF9800")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                ("GRID", (0, 0), (-1, -1), 1, colors.black),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ]
+        )
+    )
+    elements.append(t2)
+    elements.append(Spacer(1, 20))
+
+    # 3. ТАБЛИЦАИ 3: Рӯйхати Хароҷот (Харид)
+    cursor.execute(
+        "SELECT date, category, amount FROM expenses WHERE user_id = ? ORDER BY id DESC",
+        (callback.from_user.id,),
+    )
+    exp_data = [["Таърих", "Категория / Харид", "Маблағ (рубл)"]]
+    for r in cursor.fetchall():
+        exp_data.append([str(r[0])[:10], r[1], str(r[2])])
+
+    elements.append(
+        Paragraph("<b>3. Ruikhati Kharojoti Harruza</b>", styles["Title"])
+    )
+    elements.append(Spacer(1, 10))
+    t3 = Table(exp_data)
+    t3.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F44336")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                ("GRID", (0, 0), (-1, -1), 1, colors.black),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ]
+        )
+    )
+    elements.append(t3)
+
+    # Сохтани PDF
+    doc.build(elements)
+    buffer.seek(0)
+
+    pdf_file = BufferedInputFile(buffer.read(), filename="Hisobot.pdf")
+    await callback.message.answer_document(
+        pdf_file, caption="📊 Ҳисоботи пӯрра дар файли PDF"
+    )
+
+
+# --- ОМОР ВА БАЛАНС ---
+@dp.callback_query(F.data == "show_balance")
+async def show_balance(callback: types.CallbackQuery):
+    cursor.execute(
+        "SELECT SUM(amount) FROM work_log WHERE user_id = ?",
+        (callback.from_user.id,),
+    )
+    total_income = cursor.fetchone()[0] or 0.0
+
+    cursor.execute(
+        "SELECT SUM(amount) FROM expenses WHERE user_id = ?",
+        (callback.from_user.id,),
+    )
+    total_expense = cursor.fetchone()[0] or 0.0
+
+    cursor.execute(
+        "SELECT SUM(amount) FROM debts WHERE user_id = ?",
+        (callback.from_user.id,),
+    )
+    total_debts = cursor.fetchone()[0] or 0.0
+
+    balance = total_income - total_expense
+
+    msg = (
+        f"💰 **Ҳолати Молиявӣ:**\n\n"
+        f"📥 Даромад (Кор): **{total_income} рубл**\n"
+        f"📤 Хароҷот (Харид): **{total_expense} рубл**\n"
+        f"🤝 Қарзҳои додашуда: **{total_debts} рубл**\n"
+        f"-----------------------------\n"
+        f"💵 **Боқимонда (Баланс): {balance} рубл**"
+    )
+    await callback.message.answer(msg, parse_mode="Markdown")
+
+
+@dp.callback_query(F.data == "delete_last")
+async def delete_last(callback: types.CallbackQuery):
+    cursor.execute(
+        "SELECT id, amount, category FROM expenses WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+        (callback.from_user.id,),
+    )
+    row = cursor.fetchone()
+    if row:
+        cursor.execute("DELETE FROM expenses WHERE id = ?", (row[0],))
+        conn.commit()
+        await callback.message.answer(
+            f"🗑 Сабти охирини хароҷот нест карда шуд: {row[1]} рубл - {row[2]}"
+        )
+    else:
+        await callback.message.answer("⚠️ Ҳеҷ сабте ёфт нашуд.")
+
+
+# --- ЁДРАСКУНИИ СУБҲОНА ---
 async def send_and_delete_msg(text, reply_markup=None):
     try:
         msg = await bot.send_message(
@@ -340,8 +468,7 @@ async def daily_reminder_scheduler():
         if now_str == "08:00":
             asyncio.create_task(
                 send_and_delete_msg(
-                    "☀️ Салом! Хайрли субҳ!\nБа кор баромадед? Тугмаи 🛠"
-                    " **Кор**-ро зер кунед.",
+                    "☀️ Салом! Ба кор баромадед? Тугмаи 🛠 **Кор**-ро зер кунед.",
                     reply_markup=work_menu(),
                 )
             )
@@ -349,7 +476,7 @@ async def daily_reminder_scheduler():
         await asyncio.sleep(20)
 
 
-# --- ВЕБ-СЕРВЕР БАРОИ RENDER (FREE WEB SERVICE) ---
+# --- ВЕБ-СЕРВЕР ---
 async def handle(request):
     return web.Response(text="Bot is running 24/7!")
 
