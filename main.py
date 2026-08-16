@@ -2,18 +2,12 @@ import asyncio
 import datetime
 import os
 import sqlite3
-from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from aiohttp import web
-
-# Библиотекаҳо барои эҷоди PDF
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from weasyprint import HTML
 
 # --- ТАНЗИМОТ ---
 TOKEN = os.getenv("TOKEN", "8560757080:AAGb9WJWfo3R9RsAA1CY37L-zmrcluov3xY")
@@ -22,11 +16,11 @@ YOUR_TELEGRAM_ID = int(os.getenv("YOUR_TELEGRAM_ID", "6900346716"))
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- БАЗАИ МАЪЛУМОТ (3 РӮЙХАТИ АЛОҲИДА) ---
+# --- БАЗАИ МАЪЛУМОТ ---
 conn = sqlite3.connect("expenses.db", check_same_thread=False)
 cursor = conn.cursor()
 
-# 1. Рӯйхати Кор (+ / - / соат / маблағ)
+# 1. Табели корӣ (+ / - / соат / маблағ)
 cursor.execute(
     """
 CREATE TABLE IF NOT EXISTS work_log (
@@ -40,7 +34,7 @@ CREATE TABLE IF NOT EXISTS work_log (
 """
 )
 
-# 2. Рӯйхати Қарзҳо (ба ки қарз додед)
+# 2. Рӯйхати Қарзҳо
 cursor.execute(
     """
 CREATE TABLE IF NOT EXISTS debts (
@@ -53,7 +47,7 @@ CREATE TABLE IF NOT EXISTS debts (
 """
 )
 
-# 3. Рӯйхати Хароҷоти ҳаррӯза
+# 3. Рӯйхати Хароҷот
 cursor.execute(
     """
 CREATE TABLE IF NOT EXISTS expenses (
@@ -98,7 +92,12 @@ def work_menu():
                 InlineKeyboardButton(
                     text="❌ Наомадам", callback_data="work_skip"
                 ),
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📋 PDF Табели Кор", callback_data="export_tabel_pdf"
+                )
+            ],
         ]
     )
 
@@ -111,12 +110,12 @@ def finance_menu():
                     text="💰 Баланс ва Омор", callback_data="show_balance"
                 ),
                 InlineKeyboardButton(
-                    text="📄 PDF Ҳисобот", callback_data="export_pdf"
+                    text="📄 Пурра PDF Ҳисобот", callback_data="export_pdf"
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="🗑 Сабти охирини хароҷотро нест кардан",
+                    text="🗑 Сабти охиринро нест кардан",
                     callback_data="delete_last",
                 )
             ],
@@ -134,7 +133,7 @@ async def start(message: types.Message):
     await message.answer(
         "👋 Салом Админ!\n\n"
         "🔑 **Калимаҳои махфӣ:**\n"
-        "• Нависед **`кор`** — тугмаҳои табели корӣ\n"
+        "• Нависед **`кор`** — тугмаҳои табели корӣ ва генерацияи PDF\n"
         "• Нависед **`хароҷот`** ё **`баланс`** — тугмаҳои молиявӣ\n\n"
         "✍️ **Намунаи сабтҳо:**\n"
         "• `300 такси` — Хароҷоти ҳаррӯза\n"
@@ -147,7 +146,9 @@ async def start(message: types.Message):
 @dp.message(F.text.lower().in_(["кор", "work", "табел"]))
 async def show_work_menu(message: types.Message):
     await message.answer(
-        "🛠 **Панели корӣ:**", reply_markup=work_menu(), parse_mode="Markdown"
+        "🛠 **Панели кори ва Табел:**",
+        reply_markup=work_menu(),
+        parse_mode="Markdown",
     )
 
 
@@ -209,7 +210,6 @@ async def work_end(callback: types.CallbackQuery):
 
     earned_rubles = round(work_hours * 500, 2)
 
-    # Сабт ба рӯйхати 1 (Кор)
     cursor.execute(
         "INSERT INTO work_log (user_id, status, hours, amount) VALUES (?, '+', ?, ?)",
         (callback.from_user.id, work_hours, earned_rubles),
@@ -240,12 +240,180 @@ async def work_skip(callback: types.CallbackQuery):
     await callback.message.answer("❌ Наомадам сабт шуд (-).")
 
 
+# --- ГЕНЕРАЦИЯИ PDF ТАБЕЛИ КОР ---
+@dp.callback_query(F.data == "export_tabel_pdf")
+async def export_tabel_pdf(callback: types.CallbackQuery):
+    await callback.message.answer("🔄 PDF Табели корӣ сохта шуда истодааст...")
+
+    cursor.execute(
+        "SELECT date, status, hours, amount FROM work_log WHERE user_id = ? ORDER BY id ASC",
+        (callback.from_user.id,),
+    )
+    rows = cursor.fetchall()
+
+    total_days = len(rows)
+    worked_days = sum(1 for r in rows if r[1] == "+")
+    skipped_days = sum(1 for r in rows if r[1] == "-")
+    total_hours = sum(r[2] for r in rows)
+    total_amount = sum(r[3] for r in rows)
+
+    table_rows_html = ""
+    for idx, r in enumerate(rows, 1):
+        date_str = str(r[0])[:10]
+        status_badge = (
+            '<span class="badge badge-success">+ Омад</span>'
+            if r[1] == "+"
+            else '<span class="badge badge-danger">- Наомад</span>'
+        )
+        table_rows_html += f"""
+        <tr>
+            <td>{idx}</td>
+            <td>{date_str}</td>
+            <td>{status_badge}</td>
+            <td>{r[2]} соат</td>
+            <td>{r[3]:,.2f} ₽</td>
+        </tr>
+        """
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <style>
+            @page {{
+                size: A4;
+                margin: 15mm;
+                background-color: #f8fafc;
+            }}
+            body {{
+                font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+                color: #1e293b;
+                margin: 0;
+                padding: 0;
+            }}
+            .header {{
+                background: linear-gradient(135deg, #1e3a8a, #3b82f6);
+                color: #ffffff;
+                padding: 24px;
+                border-radius: 12px;
+                margin-bottom: 24px;
+            }}
+            .header h1 {{
+                margin: 0 0 6px 0;
+                font-size: 22pt;
+            }}
+            .stats-grid {{
+                display: table;
+                width: 100%;
+                margin-bottom: 24px;
+            }}
+            .stat-card {{
+                display: table-cell;
+                width: 25%;
+                background: #ffffff;
+                padding: 14px;
+                border-radius: 8px;
+                border: 1px solid #e2e8f0;
+                text-align: center;
+            }}
+            .stat-value {{
+                font-size: 16pt;
+                font-weight: bold;
+                color: #0f172a;
+            }}
+            .stat-label {{
+                font-size: 9pt;
+                color: #64748b;
+                margin-top: 4px;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                background: #ffffff;
+                border-radius: 8px;
+                overflow: hidden;
+                border: 1px solid #e2e8f0;
+            }}
+            th {{
+                background-color: #f1f5f9;
+                color: #334155;
+                font-weight: bold;
+                text-align: left;
+                padding: 10px 12px;
+                font-size: 10pt;
+                border-bottom: 2px solid #cbd5e1;
+            }}
+            td {{
+                padding: 10px 12px;
+                font-size: 10pt;
+                border-bottom: 1px solid #e2e8f0;
+            }}
+            .badge {{
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-weight: bold;
+                font-size: 8pt;
+            }}
+            .badge-success {{ background-color: #dcfce7; color: #166534; }}
+            .badge-danger {{ background-color: #fee2e2; color: #991b1b; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>📋 Табели Кори ва Маош</h1>
+            <p style="margin:0; opacity:0.9;">Ҳисоботи соатҳои корӣ ва маблағи ҳисобшуда</p>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value">{worked_days} / {total_days}</div>
+                <div class="stat-label">Рӯзҳои корӣ</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{skipped_days}</div>
+                <div class="stat-label">Наомада</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{total_hours} соат</div>
+                <div class="stat-label">Ҷамъи соат</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" style="color:#16a34a;">{total_amount:,.2f} ₽</div>
+                <div class="stat-label">Ҷамъи маош</div>
+            </div>
+        </div>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>№</th>
+                    <th>Таърих</th>
+                    <th>Статус</th>
+                    <th>Соати корӣ</th>
+                    <th>Маблағи корӣ</th>
+                </tr>
+            </thead>
+            <tbody>
+                {table_rows_html}
+            </tbody>
+        </table>
+    </body>
+    </html>
+    """
+
+    pdf_bytes = HTML(string=html_content).write_pdf()
+    pdf_file = BufferedInputFile(pdf_bytes, filename="Tabel_Kori.pdf")
+    await callback.message.answer_document(
+        pdf_file, caption="📋 Табели кории шумо дар формати PDF"
+    )
+
+
 # --- САБТИ ТЕКСТИИ ХАРОҶОТ, ҚАРЗ ВА ДАРОМАД ---
 @dp.message()
 async def add_transaction(message: types.Message):
     text = message.text.strip()
     try:
-        # Сабти Қарз (Масалан: "қарз Али 500" ё "карз Васеъ 1000")
         if text.lower().startswith(("қарз", "карз")):
             parts = text.split(maxsplit=2)
             person = parts[1]
@@ -260,7 +428,6 @@ async def add_transaction(message: types.Message):
                 parse_mode="Markdown",
             )
 
-        # Сабти Даромади иловагӣ (Масалан: "+2000 аванс")
         elif text.startswith("+"):
             clean_text = text[1:].strip()
             parts = clean_text.split(maxsplit=1)
@@ -275,7 +442,6 @@ async def add_transaction(message: types.Message):
                 parse_mode="Markdown",
             )
 
-        # Хароҷоти ҳаррӯза (Масалан: "300 такси")
         else:
             parts = text.split(maxsplit=1)
             amount = float(parts[0])
@@ -293,187 +459,10 @@ async def add_transaction(message: types.Message):
     except Exception:
         await message.answer(
             "⚠️ Фармони номаълум!\n"
-            "• Кор: `кор` ё `хароҷот`\n"
+            "• Нависед **`кор`** барои табел ва PDF\n"
             "• Хароҷот: `300 такси`\n"
             "• Қарз: `қарз Али 500`"
         )
-
-
-# --- ЭҶОДИ ҲИСОБОТИ PDF (3 РӮЙХАТИ АЛОҲИДА) ---
-@dp.callback_query(F.data == "export_pdf")
-async def export_pdf(callback: types.CallbackQuery):
-    await callback.message.answer("🔄 Файли PDF тайёр шуда истодааст...")
-
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
-    elements = []
-    styles = getSampleStyleSheet()
-
-    # 1. ТАБЛИЦАИ 1: Рӯйхати Соати Корӣ ва Маблағ
-    cursor.execute(
-        "SELECT date, status, hours, amount FROM work_log WHERE user_id = ? ORDER BY id DESC",
-        (callback.from_user.id,),
-    )
-    work_data = [["Таърих", "Статус", "Соат", "Маблағ (рубл)"]]
-    for r in cursor.fetchall():
-        work_data.append([str(r[0])[:10], r[1], str(r[2]), str(r[3])])
-
-    elements.append(Paragraph("<b>1. Ruikhati Kori va Mablag</b>", styles["Title"]))
-    elements.append(Spacer(1, 10))
-    t1 = Table(work_data)
-    t1.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4CAF50")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ]
-        )
-    )
-    elements.append(t1)
-    elements.append(Spacer(1, 20))
-
-    # 2. ТАБЛИЦАИ 2: Рӯйхати Қарзҳо
-    cursor.execute(
-        "SELECT date, person, amount FROM debts WHERE user_id = ? ORDER BY id DESC",
-        (callback.from_user.id,),
-    )
-    debt_data = [["Таърих", "Ба ки (Шахс)", "Маблағ (рубл)"]]
-    for r in cursor.fetchall():
-        debt_data.append([str(r[0])[:10], r[1], str(r[2])])
-
-    elements.append(
-        Paragraph("<b>2. Ruikhati Qarzhoi Dodashuda</b>", styles["Title"])
-    )
-    elements.append(Spacer(1, 10))
-    t2 = Table(debt_data)
-    t2.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#FF9800")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ]
-        )
-    )
-    elements.append(t2)
-    elements.append(Spacer(1, 20))
-
-    # 3. ТАБЛИЦАИ 3: Рӯйхати Хароҷот (Харид)
-    cursor.execute(
-        "SELECT date, category, amount FROM expenses WHERE user_id = ? ORDER BY id DESC",
-        (callback.from_user.id,),
-    )
-    exp_data = [["Таърих", "Категория / Харид", "Маблағ (рубл)"]]
-    for r in cursor.fetchall():
-        exp_data.append([str(r[0])[:10], r[1], str(r[2])])
-
-    elements.append(
-        Paragraph("<b>3. Ruikhati Kharojoti Harruza</b>", styles["Title"])
-    )
-    elements.append(Spacer(1, 10))
-    t3 = Table(exp_data)
-    t3.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F44336")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ]
-        )
-    )
-    elements.append(t3)
-
-    # Сохтани PDF
-    doc.build(elements)
-    buffer.seek(0)
-
-    pdf_file = BufferedInputFile(buffer.read(), filename="Hisobot.pdf")
-    await callback.message.answer_document(
-        pdf_file, caption="📊 Ҳисоботи пӯрра дар файли PDF"
-    )
-
-
-# --- ОМОР ВА БАЛАНС ---
-@dp.callback_query(F.data == "show_balance")
-async def show_balance(callback: types.CallbackQuery):
-    cursor.execute(
-        "SELECT SUM(amount) FROM work_log WHERE user_id = ?",
-        (callback.from_user.id,),
-    )
-    total_income = cursor.fetchone()[0] or 0.0
-
-    cursor.execute(
-        "SELECT SUM(amount) FROM expenses WHERE user_id = ?",
-        (callback.from_user.id,),
-    )
-    total_expense = cursor.fetchone()[0] or 0.0
-
-    cursor.execute(
-        "SELECT SUM(amount) FROM debts WHERE user_id = ?",
-        (callback.from_user.id,),
-    )
-    total_debts = cursor.fetchone()[0] or 0.0
-
-    balance = total_income - total_expense
-
-    msg = (
-        f"💰 **Ҳолати Молиявӣ:**\n\n"
-        f"📥 Даромад (Кор): **{total_income} рубл**\n"
-        f"📤 Хароҷот (Харид): **{total_expense} рубл**\n"
-        f"🤝 Қарзҳои додашуда: **{total_debts} рубл**\n"
-        f"-----------------------------\n"
-        f"💵 **Боқимонда (Баланс): {balance} рубл**"
-    )
-    await callback.message.answer(msg, parse_mode="Markdown")
-
-
-@dp.callback_query(F.data == "delete_last")
-async def delete_last(callback: types.CallbackQuery):
-    cursor.execute(
-        "SELECT id, amount, category FROM expenses WHERE user_id = ? ORDER BY id DESC LIMIT 1",
-        (callback.from_user.id,),
-    )
-    row = cursor.fetchone()
-    if row:
-        cursor.execute("DELETE FROM expenses WHERE id = ?", (row[0],))
-        conn.commit()
-        await callback.message.answer(
-            f"🗑 Сабти охирини хароҷот нест карда шуд: {row[1]} рубл - {row[2]}"
-        )
-    else:
-        await callback.message.answer("⚠️ Ҳеҷ сабте ёфт нашуд.")
-
-
-# --- ЁДРАСКУНИИ СУБҲОНА ---
-async def send_and_delete_msg(text, reply_markup=None):
-    try:
-        msg = await bot.send_message(
-            YOUR_TELEGRAM_ID, text, reply_markup=reply_markup
-        )
-        await asyncio.sleep(20 * 60)
-        await bot.delete_message(
-            chat_id=YOUR_TELEGRAM_ID, message_id=msg.message_id
-        )
-    except Exception as e:
-        print(f"Хатогии смс: {e}")
-
-
-async def daily_reminder_scheduler():
-    while True:
-        now_str = get_msk_time().strftime("%H:%M")
-        if now_str == "08:00":
-            asyncio.create_task(
-                send_and_delete_msg(
-                    "☀️ Салом! Ба кор баромадед? Тугмаи 🛠 **Кор**-ро зер кунед.",
-                    reply_markup=work_menu(),
-                )
-            )
-            await asyncio.sleep(60)
-        await asyncio.sleep(20)
 
 
 # --- ВЕБ-СЕРВЕР ---
@@ -493,7 +482,6 @@ async def start_web_server():
 
 async def main():
     await start_web_server()
-    asyncio.create_task(daily_reminder_scheduler())
     await dp.start_polling(bot)
 
 
